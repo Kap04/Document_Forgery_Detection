@@ -1,0 +1,934 @@
+# 1st
+!pip install keras-tuner
+!pip install pytesseract
+
+
+import os
+import numpy as np
+import cv2
+import tensorflow as tf
+
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from tensorflow.keras.applications.resnet50 import ResNet50, preprocess_input as resnet_preprocess
+from tensorflow.keras.layers import GlobalAveragePooling2D, Dense, Dropout, Concatenate, Input
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.losses import BinaryCrossentropy
+from tensorflow.keras.metrics import AUC
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, LearningRateScheduler
+from transformers import TFBertForSequenceClassification, BertTokenizer
+from skimage.feature import local_binary_pattern, graycomatrix, graycoprops
+from skimage.metrics import structural_similarity as compare_ssim
+import pytesseract
+from PIL import Image
+import h5py
+import logging
+import joblib
+import gc
+from sklearn.model_selection import train_test_split, KFold
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, LearningRateScheduler
+import tempfile
+from keras_tuner import RandomSearch
+import logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Configuration
+config = {
+    'genuine_folder': "/content/drive/MyDrive/datasets/genuine",
+    'tampered_folder': "/content/drive/MyDrive/datasets/tampered",
+    'checkpoint_dir': '/content/drive/MyDrive/datasets/checkpoint',
+    'output_dir': '/content/drive/MyDrive/datasets/output',
+
+    'batch_size': 32,
+    'epochs': 10,
+    'learning_rate': 1e-4,
+}
+
+DEFAULT_CONFIG = {
+    'image_size': 224,
+    'augment_data': True,
+    'batch_size': 32,
+    'epochs': 10
+}
+def load_config():
+    # This is a placeholder implementation. In a real-world scenario,
+    # you might load this from a JSON or YAML file.
+    return {
+        'genuine_folder': "/content/drive/MyDrive/datasets/genuine",
+        'tampered_folder': "/content/drive/MyDrive/datasets/tampered",
+        'checkpoint_dir': '/content/drive/MyDrive/datasets/checkpoint',
+        'output_dir': '/content/drive/MyDrive/datasets/output',
+
+        'image_size': 256,
+        'augment_data': True,
+        'batch_size': 32,
+        'epochs': 10
+    }
+
+
+
+# Create necessary directories
+os.makedirs(config['checkpoint_dir'], exist_ok=True)
+os.makedirs(config['output_dir'], exist_ok=True)
+
+#2 code shell
+# load datasets
+
+# Data Augmentation
+def augment_image(image):
+    image = tf.convert_to_tensor(image)
+    augmented = tf.image.random_flip_left_right(image)
+    augmented = tf.image.random_brightness(augmented, max_delta=0.2)
+    augmented = tf.image.random_contrast(augmented, lower=0.8, upper=1.2)
+    return augmented.numpy().astype(np.uint8)
+
+def load_images_from_folder(folder, output_size=(224, 224), augment=False):
+    images = []
+    filenames = []
+    for filename in os.listdir(folder):
+        if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.tiff', '.bmp', '.gif')):
+            image_path = os.path.join(folder, filename)
+            image = cv2.imread(image_path)
+            if image is not None:
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                image = cv2.resize(image, output_size)
+                images.append(image)
+                filenames.append(filename)
+                if augment:
+                    augmented_image = augment_image(image)
+                    images.append(augmented_image)
+                    filenames.append(f"aug_{filename}")
+            else:
+                logging.warning(f"Could not read image {filename} in {folder}")
+    return images, filenames
+
+def load_datasets(genuine_folder, tampered_folder, output_size=(224, 224)):
+    train_genuine_images, train_genuine_filenames = load_images_from_folder(
+        os.path.join(genuine_folder, 'train'), output_size
+    )
+    train_tampered_images, train_tampered_filenames = load_images_from_folder(
+        os.path.join(tampered_folder, 'train'), output_size
+    )
+    test_genuine_images, test_genuine_filenames = load_images_from_folder(
+        os.path.join(genuine_folder, 'test'), output_size
+    )
+    test_tampered_images, test_tampered_filenames = load_images_from_folder(
+        os.path.join(tampered_folder, 'test'), output_size
+    )
+
+    return (
+        train_genuine_images, train_tampered_images,
+        test_genuine_images, test_tampered_images
+    )
+
+def extract_text(image):
+    # Convert the image to grayscale
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+
+    # Apply thresholding to preprocess the image
+    threshold = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+
+    # Perform text extraction
+    text = pytesseract.image_to_string(threshold)
+
+    # Clean the extracted text
+    text = text.strip()  # Remove leading/trailing whitespace
+    text = ' '.join(text.split())  # Remove extra whitespace within the text
+
+    return text
+
+def load_and_save_datasets(genuine_folder, tampered_folder,checkpoint_dir, output_size=(224, 224), augment=False):
+    checkpoint_file = os.path.join(checkpoint_dir, 'datasets_checkpoint.npz')
+
+    if os.path.exists(checkpoint_file):
+        print("Loading datasets from checkpoint...")
+        data = np.load(checkpoint_file, allow_pickle=True)
+        return (data['train_genuine_images'], data['train_genuine_texts'],
+                data['train_tampered_images'], data['train_tampered_texts'],
+                data['test_genuine_images'], data['test_genuine_texts'],
+                data['test_tampered_images'], data['test_tampered_texts'])
+
+    def load_images_and_text_from_folder(folder):
+        images, filenames = load_images_from_folder(folder, output_size, augment)
+        texts = []
+        for image in images:
+            text = extract_text(image)
+            texts.append(text)
+        return images, texts
+
+    train_genuine_images, train_genuine_texts = load_images_and_text_from_folder(os.path.join(genuine_folder, 'train'))
+    train_tampered_images, train_tampered_texts = load_images_and_text_from_folder(os.path.join(tampered_folder, 'train'))
+    test_genuine_images, test_genuine_texts = load_images_and_text_from_folder(os.path.join(genuine_folder, 'test'))
+    test_tampered_images, test_tampered_texts = load_images_and_text_from_folder(os.path.join(tampered_folder, 'test'))
+
+    print("Saving datasets checkpoint...")
+    np.savez_compressed(checkpoint_file,
+                        train_genuine_images=train_genuine_images, train_genuine_texts=train_genuine_texts,
+                        train_tampered_images=train_tampered_images, train_tampered_texts=train_tampered_texts,
+                        test_genuine_images=test_genuine_images, test_genuine_texts=test_genuine_texts,
+                        test_tampered_images=test_tampered_images, test_tampered_texts=test_tampered_texts)
+
+    return (train_genuine_images, train_genuine_texts,
+            train_tampered_images, train_tampered_texts,
+            test_genuine_images, test_genuine_texts,
+            test_tampered_images, test_tampered_texts)
+
+# Install Tesseract OCR
+!sudo apt-get install tesseract-ocr
+
+# Install the Python wrapper for Tesseract
+!pip install pytesseract
+
+# Shell 3: Feature Generation
+def ela_image(image, quality=90):
+    # Create a temporary file to save the image
+    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as temp_file:
+        temp_filename = temp_file.name
+        cv2.imwrite(temp_filename, image, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        compressed_image = cv2.imread(temp_filename)
+
+    ela_image = np.abs(image.astype(np.float32) - compressed_image.astype(np.float32))
+
+    os.remove(temp_filename)
+    return ela_image / ela_image.max() * 255
+
+def extract_lbp_features(image, P=8, R=1):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    lbp = local_binary_pattern(gray, P, R, method="uniform")
+    return lbp.flatten()
+
+def extract_glcm_features(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    glcm = graycomatrix(gray, [1], [0, np.pi/4, np.pi/2, 3*np.pi/4])
+    contrast = graycoprops(glcm, 'contrast').flatten()
+    dissimilarity = graycoprops(glcm, 'dissimilarity').flatten()
+    homogeneity = graycoprops(glcm, 'homogeneity').flatten()
+    energy = graycoprops(glcm, 'energy').flatten()
+    correlation = graycoprops(glcm, 'correlation').flatten()
+    return np.concatenate([contrast, dissimilarity, homogeneity, energy, correlation])
+
+def calculate_image_quality_metrics(image1, image2):
+    gray1 = cv2.cvtColor(image1, cv2.COLOR_BGR2GRAY)
+    gray2 = cv2.cvtColor(image2, cv2.COLOR_BGR2GRAY)
+
+    mse = np.mean((gray1 - gray2) ** 2)
+    ssim = compare_ssim(gray1, gray2)
+
+    return mse, ssim
+
+def extract_text(image):
+    # Convert the image to grayscale
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    # Apply thresholding to preprocess the image
+    threshold = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+
+    # Perform text extraction
+    text = pytesseract.image_to_string(threshold)
+
+    # Clean the extracted text
+    text = text.strip()  # Remove leading/trailing whitespace
+    text = ' '.join(text.split())  # Remove extra whitespace within the text
+
+    return text
+
+def extract_ink_color_features(image):
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [180, 256], [0, 180, 0, 256])
+    return hist.flatten()
+
+def preprocess_image_data(image):
+    # Resize the image
+    resized_image = cv2.resize(image, (224, 224))
+
+    # ResNet preprocessing
+    resnet_input = resnet_preprocess(resized_image)
+
+    # Convert to grayscale
+    gray = cv2.cvtColor(resized_image, cv2.COLOR_RGB2GRAY)
+
+    # LBP features
+    lbp = local_binary_pattern(gray, 8, 1, method="uniform")
+
+    # GLCM features
+    glcm = graycomatrix(gray, [1], [0, np.pi/4, np.pi/2, 3*np.pi/4])
+    contrast = graycoprops(glcm, 'contrast').flatten()
+
+    # Combine features
+    combined_features = np.concatenate([
+        resnet_input.flatten(),  # 224 * 224 * 3 = 150528
+        lbp.flatten(),           # 224 * 224 = 50176
+        contrast                 # 4
+    ])
+
+    # Ensure the output has exactly 50176 features
+    if len(combined_features) > 50176:
+        return combined_features[:50176]
+    elif len(combined_features) < 50176:
+        return np.pad(combined_features, (0, 50176 - len(combined_features)), 'constant')
+    else:
+        return combined_features
+
+def preprocess_text(text, max_length=512):
+    if not text:
+        # Return a zero vector if the text is empty
+        return np.zeros((1, max_length), dtype=int)
+
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    encoded = tokenizer.encode_plus(
+        text,
+        add_special_tokens=True,
+        max_length=max_length,
+        padding='max_length',
+        truncation=True,
+        return_tensors='np'
+    )
+
+    return encoded['input_ids']
+
+def preprocess_sample(image_path):
+    image_features = preprocess_image_data(image_path)
+    extracted_text = extract_text(cv2.imread(image_path))
+    text_features = preprocess_text(extracted_text)
+
+    return image_features, text_features
+
+
+
+def generate_and_save_features(images, texts, labels, output_dir, batch_size=1000, prefix=''):
+    for i in range(0, len(images), batch_size):
+        batch_images = images[i:i+batch_size]
+        batch_texts = texts[i:i+batch_size]
+        batch_labels = labels[i:i+batch_size]
+
+        image_features_file = os.path.join(output_dir, f'{prefix}_image_features_batch_{i//batch_size}.npy')
+        text_features_file = os.path.join(output_dir, f'{prefix}_text_features_batch_{i//batch_size}.npy')
+        labels_file = os.path.join(output_dir, f'{prefix}_labels_batch_{i//batch_size}.npy')
+
+        if not (os.path.exists(image_features_file) and
+                os.path.exists(text_features_file) and
+                os.path.exists(labels_file)):
+            print(f"Generating features for {prefix} batch {i//batch_size}...")
+            image_features = [preprocess_image_data(img) for img in batch_images]
+            text_features = [preprocess_text(txt) for txt in batch_texts]
+
+            np.save(image_features_file, image_features)
+            np.save(text_features_file, text_features)
+            np.save(labels_file, batch_labels)
+        else:
+            print(f"Features for {prefix} batch {i//batch_size} already exist. Skipping...")
+
+    logging.info(f"Features for {prefix} generated and saved successfully.")
+
+# Shell 4: Feature Aggregation
+import itertools
+def aggregate_image_features(image_features):
+    resnet_features = image_features['resnet_input'].flatten()
+    ela_features = image_features['ela'].flatten()
+    lbp_features = image_features['lbp_features']
+    glcm_features = image_features['glcm_features']
+    ink_color_features = image_features['ink_color_features']
+
+    combined_features = np.concatenate([
+        resnet_features,
+        ela_features,
+        lbp_features,
+        glcm_features,
+        ink_color_features,
+        [image_features['mse']],
+        [image_features['ssim']]
+    ])
+
+    return combined_features
+
+def aggregate_text_features(text_features):
+    if isinstance(text_features, dict):
+        if 'input_ids' in text_features:
+            # If it's a dictionary with 'input_ids' key (like BERT tokenizer output)
+            return np.array(text_features['input_ids']).flatten()
+        else:
+            # If it's a dictionary but doesn't have 'input_ids', use all values
+            return np.concatenate([np.array(v).flatten() for v in text_features.values()])
+    elif isinstance(text_features, (list, np.ndarray)):
+        # If it's already a list or numpy array
+        return np.array(text_features).flatten()
+    elif isinstance(text_features, str):
+        # If it's a string (raw text), convert to list of characters
+        return np.array(list(text_features)).flatten()
+    else:
+        raise ValueError(f"Unsupported text_features type: {type(text_features)}")
+
+def aggregate_features(image_features_list, text_features_list):
+    aggregated_features = []
+    for img_features, txt_features in zip(image_features_list, text_features_list):
+        img_agg = aggregate_image_features(img_features)
+        txt_agg = aggregate_text_features(txt_features)
+        combined = np.concatenate([img_agg, txt_agg])
+        aggregated_features.append(combined)
+    return np.array(aggregated_features)
+
+def normalize_features(features, method='standard'):
+    if method == 'standard':
+        scaler = StandardScaler()
+    elif method == 'minmax':
+        scaler = MinMaxScaler()
+    else:
+        raise ValueError("Unsupported normalization method")
+
+    return scaler.fit_transform(features), scaler
+
+def prepare_data_for_model(train_images, train_texts, train_labels, test_images, test_texts, test_labels, normalization_method='standard'):
+    train_features = aggregate_features(train_images, train_texts)
+    test_features = aggregate_features(test_images, test_texts)
+
+    train_features_normalized, feature_scaler = normalize_features(train_features, method=normalization_method)
+    test_features_normalized = feature_scaler.transform(test_features)
+
+    joblib.dump(feature_scaler, os.path.join(config['checkpoint_dir'], 'feature_scaler.pkl'))
+
+    train_labels = np.array(train_labels)
+    test_labels = np.array(test_labels)
+
+    train_labels_binary = (train_labels == 'tampered').astype(int)
+    test_labels_binary = (test_labels == 'tampered').astype(int)
+
+    return train_features_normalized, train_labels_binary, test_features_normalized, test_labels_binary
+
+
+
+import numpy as np
+import h5py
+import os
+import gc
+from sklearn.preprocessing import StandardScaler
+import itertools
+
+import numpy as np
+import h5py
+import os
+import gc
+
+
+def process_dataset(data, dataset_keys, dataset_type, output_dir, chunk_size=100):
+    print(f"Processing {dataset_type} dataset...")
+    features_filename = os.path.join(output_dir, f'{dataset_type}_features.h5')
+    labels_filename = os.path.join(output_dir, f'{dataset_type}_labels.npy')
+
+    if os.path.exists(features_filename) and os.path.exists(labels_filename):
+        print(f"Found existing {dataset_type} features and labels files.")
+        return features_filename, labels_filename
+
+    total_samples = sum(len(data[key]) for key in dataset_keys['images'] if key in data)
+    print(f"Total samples in {dataset_type} dataset: {total_samples}")
+
+    with h5py.File(features_filename, 'w') as f:
+        features_dataset = f.create_dataset('features', shape=(total_samples, 50176), dtype='float32',
+                                            chunks=(1, 50176), compression="gzip", compression_opts=9)
+
+        labels = np.memmap(labels_filename, dtype='int32', mode='w+', shape=(total_samples,))
+
+        sample_index = 0
+        for i in range(0, len(dataset_keys['images']), 2):
+            image_key_genuine = dataset_keys['images'][i]
+            image_key_tampered = dataset_keys['images'][i+1]
+
+            print(f"Processing {image_key_genuine}...")
+            for j in range(len(data[image_key_genuine])):
+                features = preprocess_image_data(data[image_key_genuine][j])
+                features_dataset[sample_index] = features
+                labels[sample_index] = 0  # 0 for genuine
+                sample_index += 1
+
+                if sample_index % chunk_size == 0:
+                    print(f"Processed {sample_index} samples...")
+                    f.flush()
+                    labels.flush()
+                    gc.collect()
+
+            print(f"Processing {image_key_tampered}...")
+            for j in range(len(data[image_key_tampered])):
+                features = preprocess_image_data(data[image_key_tampered][j])
+                features_dataset[sample_index] = features
+                labels[sample_index] = 1  # 1 for tampered
+                sample_index += 1
+
+                if sample_index % chunk_size == 0:
+                    print(f"Processed {sample_index} samples...")
+                    f.flush()
+                    labels.flush()
+                    gc.collect()
+
+        labels.flush()
+
+    print(f"{dataset_type} dataset processing completed.")
+    return features_filename, labels_filename
+
+
+def normalize_features(features_file, output_file, chunk_size=1000):
+    print(f"Normalizing features from {features_file}...")
+    scaler = StandardScaler()
+
+    with h5py.File(features_file, 'r') as f_in, h5py.File(output_file, 'w') as f_out:
+        features_dataset = f_in['features']
+        total_samples, features_shape = features_dataset.shape
+        print(f"Total samples: {total_samples}, Feature shape: {features_shape}")
+
+        normalized_dataset = f_out.create_dataset('features', shape=(total_samples, features_shape),
+                                                  dtype='float32', chunks=(1, features_shape),
+                                                  compression="gzip", compression_opts=9)
+
+        print("Fitting scaler...")
+        for start in range(0, total_samples, chunk_size):
+            end = min(start + chunk_size, total_samples)
+            chunk = features_dataset[start:end]
+            scaler.partial_fit(chunk)
+            print(f"Fitted scaler on samples {start} to {end}")
+            del chunk
+            gc.collect()
+
+        print("Transforming and saving normalized features...")
+        for start in range(0, total_samples, chunk_size):
+            end = min(start + chunk_size, total_samples)
+            chunk = features_dataset[start:end]
+            normalized_chunk = scaler.transform(chunk)
+            normalized_dataset[start:end] = normalized_chunk
+            print(f"Normalized and saved samples {start} to {end}")
+            del chunk, normalized_chunk
+            gc.collect()
+
+    print(f"Feature normalization completed. Normalized features saved to {output_file}")
+    return output_file
+
+def aggregate_and_normalize_features(input_dir, output_dir, chunk_size=1000):
+    print("Starting feature aggregation and normalization process...")
+    os.makedirs(output_dir, exist_ok=True)
+    final_features_file = os.path.join(output_dir, 'final_features.h5')
+
+    if os.path.exists(final_features_file):
+        print(f"Found existing final features file: {final_features_file}")
+        return final_features_file
+
+    checkpoint_file = os.path.join(input_dir, 'datasets_checkpoint.npz')
+
+    if not os.path.exists(checkpoint_file):
+        raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_file}")
+
+    print(f"Loading data from checkpoint: {checkpoint_file}")
+    with np.load(checkpoint_file, allow_pickle=True) as data:
+        train_keys = {
+            'images': ['train_genuine_images', 'train_tampered_images'],
+            'texts': ['train_genuine_texts', 'train_tampered_texts'],
+        }
+        test_keys = {
+            'images': ['test_genuine_images', 'test_tampered_images'],
+            'texts': ['test_genuine_texts', 'test_tampered_texts'],
+        }
+
+        print("Processing training data...")
+        train_features_file, train_labels_file = process_dataset(data, train_keys, 'train', output_dir, chunk_size)
+        print("Processing test data...")
+        test_features_file, test_labels_file = process_dataset(data, test_keys, 'test', output_dir, chunk_size)
+
+    print("Normalizing training features...")
+    normalized_train_features_file = normalize_features(train_features_file,
+                                                        os.path.join(output_dir, 'normalized_train_features.h5'),
+                                                        chunk_size)
+    print("Normalizing test features...")
+    normalized_test_features_file = normalize_features(test_features_file,
+                                                       os.path.join(output_dir, 'normalized_test_features.h5'),
+                                                       chunk_size)
+
+    print(f"Combining normalized features and labels into final file: {final_features_file}")
+    with h5py.File(final_features_file, 'w') as f_out:
+        with h5py.File(normalized_train_features_file, 'r') as f_train, \
+             h5py.File(normalized_test_features_file, 'r') as f_test, \
+             np.load(train_labels_file, mmap_mode='r') as train_labels, \
+             np.load(test_labels_file, mmap_mode='r') as test_labels:
+
+            print("Writing train features...")
+            f_out.create_dataset('train_features', data=f_train['features'], chunks=True, compression="gzip", compression_opts=9)
+            print("Writing train labels...")
+            f_out.create_dataset('train_labels', data=train_labels, chunks=True, compression="gzip", compression_opts=9)
+            print("Writing test features...")
+            f_out.create_dataset('test_features', data=f_test['features'], chunks=True, compression="gzip", compression_opts=9)
+            print("Writing test labels...")
+            f_out.create_dataset('test_labels', data=test_labels, chunks=True, compression="gzip", compression_opts=9)
+
+    print("Cleaning up intermediate files...")
+    os.remove(train_features_file)
+    os.remove(test_features_file)
+    os.remove(train_labels_file)
+    os.remove(test_labels_file)
+    os.remove(normalized_train_features_file)
+    os.remove(normalized_test_features_file)
+
+    print("Feature aggregation and normalization completed successfully.")
+    return final_features_file
+
+# Shell 5: Text Model Training with Mid-Training Validation
+import os
+import tensorflow as tf
+from transformers import TFBertForSequenceClassification, BertTokenizer
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
+
+def train_text_model(text_features, labels, output_dir, max_length=512, batch_size=16, epochs=5, validation_size=0.2):
+    checkpoint_path = os.path.join(output_dir, 'text_model_checkpoint.h5')
+
+    if os.path.exists(checkpoint_path):
+        print("Loading text model from checkpoint...")
+        model = TFBertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=1)
+        model.load_weights(checkpoint_path)
+    else:
+        print("Initializing new text model...")
+        model = TFBertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=1)
+
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+
+    def tokenize_function(examples):
+        return tokenizer(examples, padding="max_length", truncation=True, max_length=max_length, return_tensors='tf')
+
+    tokenized_dataset = tokenize_function(text_features)
+
+    dataset = tf.data.Dataset.from_tensor_slices((
+        {'input_ids': np.array(tokenized_dataset['input_ids']),
+         'attention_mask': np.array(tokenized_dataset['attention_mask'])},
+        np.array(labels)
+    ))
+
+    dataset = dataset.shuffle(1000)
+    validation_size = int(validation_size * len(labels))
+
+    validation_data = dataset.take(validation_size).batch(batch_size)
+    train_data = dataset.skip(validation_size).batch(batch_size)
+
+    optimizer = Adam(learning_rate=2e-5)
+    loss = BinaryCrossentropy(from_logits=True)
+    metric = AUC(name='auc')
+
+    model.compile(optimizer=optimizer, loss=loss, metrics=[metric])
+
+    # Add callbacks
+    checkpoint = ModelCheckpoint(checkpoint_path, monitor='val_auc', save_best_only=True, mode='max')
+    early_stopping = EarlyStopping(monitor='val_auc', patience=3, restore_best_weights=True, mode='max')
+
+    # Training loop with mid-training validation
+    for epoch in range(epochs):
+        print(f"Epoch {epoch + 1}/{epochs}")
+        model.fit(train_data, epochs=1, validation_data=validation_data, callbacks=[checkpoint, early_stopping])
+
+        # Evaluate on validation data after each epoch
+        val_results = model.evaluate(validation_data)
+        print(f"Validation results after epoch {epoch + 1}: {val_results}")
+
+    # Save the final model
+    model.save(os.path.join(output_dir, 'text_model.h5'))
+    logging.info("Text model saved successfully.")
+
+    return model
+
+# Shell 6: Image Model Training with Mid-Training Validation
+
+def build_tunable_image_model(hp):
+    base_model = ResNet50(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+    base_model.trainable = False
+
+    x = GlobalAveragePooling2D()(base_model.output)
+    x = Dense(
+        units=hp.Int('dense_units', min_value=64, max_value=1024, step=64),
+        activation='relu'
+    )(x)
+    x = Dropout(hp.Float('dropout', min_value=0.0, max_value=0.5, step=0.1))(x)
+    output = Dense(1, activation='sigmoid')(x)
+
+    model = Model(inputs=base_model.input, outputs=output)
+
+    model.compile(
+        optimizer=Adam(hp.Float('learning_rate', min_value=1e-4, max_value=1e-2, sampling='LOG')),
+        loss=BinaryCrossentropy(),
+        metrics=[AUC(name='auc')]
+    )
+
+    return model
+
+def fine_tune_resnet50(image_features, labels, input_shape=(224, 224, 3), batch_size=32, epochs=10):
+    tuner = RandomSearch(
+        build_tunable_image_model,
+        objective='val_auc',
+        max_trials=5,
+        executions_per_trial=3,
+        directory='image_model_tuning',
+        project_name='image_tampering_detection'
+    )
+
+    tuner.search(image_features, labels, epochs=5, validation_split=0.2)
+
+    best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
+    model = tuner.hypermodel.build(best_hps)
+
+    history = model.fit(image_features, labels, epochs=epochs, validation_split=0.2, batch_size=batch_size)
+
+    # Fine-tuning
+    for layer in model.layers[-20:]:
+        layer.trainable = True
+
+    model.compile(
+        optimizer=Adam(learning_rate=best_hps.get('learning_rate') / 10),
+        loss=BinaryCrossentropy(),
+        metrics=[AUC(name='auc')]
+    )
+
+    fine_tuning_history = model.fit(image_features, labels, epochs=5, validation_split=0.2, batch_size=batch_size)
+
+    return model, history, fine_tuning_history
+
+# Cross-validation function
+def cross_validate_models(text_features, image_features, labels, n_splits=5):
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+    text_scores = []
+    image_scores = []
+    fusion_scores = []
+
+    for fold, (train_index, val_index) in enumerate(kf.split(text_features)):
+        print(f"Fold {fold + 1}/{n_splits}")
+
+        X_text_train, X_text_val = text_features[train_index], text_features[val_index]
+        X_image_train, X_image_val = image_features[train_index], image_features[val_index]
+        y_train, y_val = labels[train_index], labels[val_index]
+
+        # Train text model
+        text_model = train_text_model(X_text_train, y_train, config['output_dir'], batch_size=config['batch_size'], epochs=config['epochs'])
+        text_score = text_model.evaluate(X_text_val, y_val)
+        text_scores.append(text_score[1])  # Assuming AUC is the second metric
+
+        # Train image model
+        image_model, _, _ = fine_tune_resnet50(X_image_train, y_train, batch_size=config['batch_size'], epochs=config['epochs'])
+        image_score = image_model.evaluate(X_image_val, y_val)
+        image_scores.append(image_score[1])  # Assuming AUC is the second metric
+
+        # Train fusion model
+        fusion_model = create_fusion_model(text_model, image_model)
+        fusion_model = train_fusion_model(fusion_model, X_text_train, X_image_train, y_train, config['output_dir'], batch_size=config['batch_size'], epochs=config['epochs'])
+        fusion_score = fusion_model.evaluate([X_text_val, X_image_val], y_val)
+        fusion_scores.append(fusion_score[1])  # Assuming AUC is the second metric
+
+        # Clear memory
+        del text_model, image_model, fusion_model
+        gc.collect()
+
+    print(f"Text Model - Mean AUC: {np.mean(text_scores):.4f} (±{np.std(text_scores):.4f})")
+    print(f"Image Model - Mean AUC: {np.mean(image_scores):.4f} (±{np.std(image_scores):.4f})")
+    print(f"Fusion Model - Mean AUC: {np.mean(fusion_scores):.4f} (±{np.std(fusion_scores):.4f})")
+
+# Shell 7: Fusion Model
+def create_fusion_model(text_model, image_model):
+    text_input = Input(shape=(768,))  # BERT output shape
+    image_input = Input(shape=(2048,))  # ResNet50 output shape
+
+    text_features = text_model.layers[-2].output
+    image_features = image_model.layers[-2].output
+
+    concatenated = Concatenate()([text_features, image_features])
+
+    x = Dense(512, activation='relu')(concatenated)
+    x = Dense(256, activation='relu')(x)
+    output = Dense(1, activation='sigmoid')(x)
+
+    fusion_model = Model(inputs=[text_input, image_input], outputs=output)
+
+    optimizer = Adam(learning_rate=1e-4)
+    loss = BinaryCrossentropy()
+    metric = AUC(name='auc')
+
+    fusion_model.compile(optimizer=optimizer, loss=loss, metrics=[metric])
+
+    return fusion_model
+
+def train_fusion_model(fusion_model, text_features, image_features, labels, output_dir, batch_size=16, epochs=5, validation_size=0.2):
+    dataset = tf.data.Dataset.from_tensor_slices((
+        {"text_input": text_features, "image_input": image_features},
+        labels
+    ))
+    dataset = dataset.shuffle(1000)
+    validation_size = int(validation_size * len(labels))
+
+    validation_data = dataset.take(validation_size).batch(batch_size)
+    train_data = dataset.skip(validation_size).batch(batch_size)
+
+    checkpoint = ModelCheckpoint(os.path.join(output_dir, 'fusion_model_best.h5'), monitor='val_auc', save_best_only=True, mode='max')
+    early_stopping = EarlyStopping(monitor='val_auc', patience=3, restore_best_weights=True, mode='max')
+    lr_scheduler = LearningRateScheduler(lambda epoch, lr: lr * tf.math.exp(-0.1) if epoch > 10 else lr)
+
+    # Training loop with mid-training validation
+    for epoch in range(epochs):
+        print(f"Epoch {epoch + 1}/{epochs}")
+        fusion_model.fit(train_data, epochs=1)
+
+        # Evaluate on validation data after each epoch
+        val_results = fusion_model.evaluate(validation_data)
+        print(f"Validation results after epoch {epoch + 1}: {val_results}")
+
+    # Save the fusion model and history
+    fusion_model.save(os.path.join(output_dir, 'fusion_model.h5'))
+    logging.info("Fusion model saved successfully.")
+
+    return fusion_model
+
+# Final Evaluation
+def evaluate_models(text_model, image_model, fusion_model, test_text_features, test_image_features, test_labels):
+    text_results = text_model.evaluate(test_text_features, test_labels)
+    image_results = image_model.evaluate(test_image_features, test_labels)
+    fusion_results = fusion_model.evaluate([test_text_features, test_image_features], test_labels)
+
+    logging.info(f"Text Model Test Results: {text_results}")
+    logging.info(f"Image Model Test Results: {image_results}")
+    logging.info(f"Fusion Model Test Results: {fusion_results}")
+
+    return text_results, image_results, fusion_results
+
+def main():
+    print("Starting the optimized main pipeline...")
+
+    config = load_config()
+    print("Configuration loaded successfully.")
+
+    # Load and save initial datasets
+    print("Loading and saving initial datasets...")
+    checkpoint_file = os.path.join(config['checkpoint_dir'], 'datasets_checkpoint.npz')
+    if os.path.exists(checkpoint_file):
+        print(f"Loading datasets from checkpoint: {checkpoint_file}")
+        data = np.load(checkpoint_file, allow_pickle=True)
+        train_genuine_images, train_genuine_texts = data['train_genuine_images'], data['train_genuine_texts']
+        train_tampered_images, train_tampered_texts = data['train_tampered_images'], data['train_tampered_texts']
+        test_genuine_images, test_genuine_texts = data['test_genuine_images'], data['test_genuine_texts']
+        test_tampered_images, test_tampered_texts = data['test_tampered_images'], data['test_tampered_texts']
+        print("Datasets loaded from checkpoint successfully.")
+    else:
+        print("No checkpoint found. Loading datasets from scratch...")
+        (train_genuine_images, train_genuine_texts,
+         train_tampered_images, train_tampered_texts,
+         test_genuine_images, test_genuine_texts,
+         test_tampered_images, test_tampered_texts) = load_and_save_datasets(
+            config['genuine_folder'], config['tampered_folder'], config['checkpoint_dir'],
+            output_size=(config['image_size'], config['image_size']), augment=config['augment_data']
+        )
+        print("Datasets loaded and saved successfully.")
+
+    # Aggregate and normalize features
+    print("Starting feature aggregation and normalization...")
+    final_features_file = aggregate_and_normalize_features(config['checkpoint_dir'], config['output_dir'])
+    print(f"Feature aggregation and normalization completed. Final features file: {final_features_file}")
+
+    # Define feature generator
+    def feature_generator(features_file, dataset='train', batch_size=32):
+        with h5py.File(features_file, 'r') as f:
+            features = f[f'{dataset}_features']
+            labels = f[f'{dataset}_labels']
+            num_samples = features.shape[0]
+
+            for start in range(0, num_samples, batch_size):
+                end = min(start + batch_size, num_samples)
+                yield features[start:end], labels[start:end]
+
+    # Cross-validation
+    print("Starting cross-validation...")
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+
+    with h5py.File(final_features_file, 'r') as f:
+        features = f['train_features']
+        labels = f['train_labels']
+
+        for fold, (train_index, val_index) in enumerate(kf.split(features)):
+            print(f"Processing fold {fold + 1}/5")
+
+            # Train models using generators
+            train_gen = feature_generator(final_features_file, indices=train_index)
+            val_gen = feature_generator(final_features_file, indices=val_index)
+
+            print(f"Training text model for fold {fold + 1}...")
+            train_and_evaluate_text_model(train_gen, val_gen, config)
+            print(f"Text model training completed for fold {fold + 1}.")
+
+            print(f"Training image model for fold {fold + 1}...")
+            train_and_evaluate_image_model(train_gen, val_gen, config)
+            print(f"Image model training completed for fold {fold + 1}.")
+
+            print(f"Training fusion model for fold {fold + 1}...")
+            train_and_evaluate_fusion_model(train_gen, val_gen, config)
+            print(f"Fusion model training completed for fold {fold + 1}.")
+
+            gc.collect()
+            print(f"Fold {fold + 1} completed. Memory cleared.")
+
+    print("Cross-validation completed.")
+
+    # Train final models
+    print("Training final models...")
+    train_gen = feature_generator(final_features_file, dataset='train')
+    test_gen = feature_generator(final_features_file, dataset='test')
+
+    print("Training final text model...")
+    text_model_checkpoint = os.path.join(config['checkpoint_dir'], 'final_text_model.h5')
+    if os.path.exists(text_model_checkpoint):
+        print("Loading text model from checkpoint...")
+        text_model = load_model(text_model_checkpoint)
+    else:
+        text_model = train_text_model(train_gen, config)
+        text_model.save(text_model_checkpoint)
+    print("Final text model ready.")
+
+    print("Training final image model...")
+    image_model_checkpoint = os.path.join(config['checkpoint_dir'], 'final_image_model.h5')
+    if os.path.exists(image_model_checkpoint):
+        print("Loading image model from checkpoint...")
+        image_model = load_model(image_model_checkpoint)
+    else:
+        image_model = train_image_model(train_gen, config)
+        image_model.save(image_model_checkpoint)
+    print("Final image model ready.")
+
+    print("Training final fusion model...")
+    fusion_model_checkpoint = os.path.join(config['checkpoint_dir'], 'final_fusion_model.h5')
+    if os.path.exists(fusion_model_checkpoint):
+        print("Loading fusion model from checkpoint...")
+        fusion_model = load_model(fusion_model_checkpoint)
+    else:
+        fusion_model = train_fusion_model(train_gen, config)
+        fusion_model.save(fusion_model_checkpoint)
+    print("Final fusion model ready.")
+
+    # Final evaluation
+    print("Starting final evaluation...")
+    evaluate_models(text_model, image_model, fusion_model, test_gen)
+    print("Final evaluation completed.")
+
+    # Clear memory
+    del text_model, image_model, fusion_model
+    gc.collect()
+    print("Models cleared from memory.")
+
+    print("Pipeline completed successfully.")
+
+if __name__ == "__main__":
+    main()
+
+
+output ;
+Starting the optimized main pipeline...
+Configuration loaded successfully.
+Loading and saving initial datasets...
+Loading datasets from checkpoint: /content/drive/MyDrive/datasets/checkpoint/datasets_checkpoint.npz
+Datasets loaded from checkpoint successfully.
+Starting feature aggregation and normalization...
+Starting feature aggregation and normalization process...
+Loading data from checkpoint: /content/drive/MyDrive/datasets/checkpoint/datasets_checkpoint.npz
+Processing training data...
+Processing train dataset...
+Total samples in train dataset: 18520
+Processing train_genuine_images...
+
+it is taking a long time for "Processing train_genuine_images...", is there a solution to speed this process , i dont have access to good gpu
